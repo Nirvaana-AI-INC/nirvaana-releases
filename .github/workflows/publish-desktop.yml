@@ -1,0 +1,212 @@
+# Publishes a Nirvaana desktop release after ONE approval, from Benny or Niko.
+#
+# Nirvaana-AI-INC/nirvaana-desktop's Release workflow (.github/workflows/release.yml there) builds every
+# merge to main that changes the app: tests on Linux and Windows, the Mac apps signed with the
+# Developer ID and notarized, Windows, the 16 files. It uploads them here as a DRAFT (the feed never
+# serves a draft), then sends the event desktop-release-ready. This workflow then waits in the
+# Environment "publish", whose required reviewers are BenicioJPadilla and nikoszy:
+#
+#   Actions > Publish desktop release > the newest run > Review deployments > publish >
+#   Approve and deploy        (GitHub's app on the phone works too: it notifies the reviewers)
+#
+# Approve and deploy: the draft is checked once more and published as the latest release, so
+# releases/latest/download/latest-mac.yml and latest.yml offer it, and every installed app shows
+# Restart to update under the person's name. Reject: nothing is published; the draft stays a draft
+# until the next merge replaces it.
+#
+# A newer draft supersedes an older one still waiting (the desktop workflow deletes the older draft,
+# and this run is cancelled by the newer one). This repository is public so that the feed is, and so
+# required reviewers work here on the Team plan; the desktop repository is private. No secret is
+# used: GitHub's own token for this run, which can only write to this repository's releases. The
+# event can only be sent with a token that can write here (the desktop workflow's RELEASES_TOKEN).
+#
+# Guards: the tag is the version and never v0.1.8 (a draft that was never published, and must never
+# be the latest); the draft carries the desktop commit it was built from and exactly the 16 files,
+# uploaded, each with the SHA-256 the build sent (GitHub's digest, or the file downloaded and
+# hashed); its latest-mac.yml and latest.yml are for this version; the version is higher than every
+# published version; no newer desktop draft is waiting. After publishing: it is the latest, v0.1.8 is
+# still a draft, and the feed answers with the new version. Nothing from the private repository but
+# the version and the commit is shown on this public run page before the release is published.
+#
+# Publishing creates the tag. The "release tags" ruleset (Settings > Rules > Rulesets) must have
+# GitHub Actions on its bypass list, and nothing else may be loosened: tags must stay closed to
+# tokens such as RELEASES_TOKEN, or a draft could be published without approval. If it refuses, this job
+# says so plainly, nothing is published, and the run can be re-run once the ruleset allows it.
+name: Publish desktop release
+run-name: Publish Nirvaana ${{ github.event.client_payload.version }}
+
+on:
+  repository_dispatch:
+    types: [desktop-release-ready]
+
+concurrency:
+  group: publish-desktop
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  # Before the approval: what is waiting, on this run's page. Only the version and the commit: this
+  # repository is public, and the notes come from the private desktop repository; they are public
+  # once the release is. The approver reads them on the draft's page (only this repo's writers see
+  # drafts), linked from the publish job.
+  show:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: What is waiting for approval
+        env:
+          VERSION: ${{ github.event.client_payload.version }}
+          COMMIT: ${{ github.event.client_payload.commit }}
+        run: |
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::'$VERSION' is not a version."; exit 1; }
+          [[ "$COMMIT" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::'$COMMIT' is not a commit."; exit 1; }
+          # The backticks are Markdown for the summary.
+          # shellcheck disable=SC2016
+          {
+            printf '## Nirvaana %s is waiting for one approval\n\n' "$VERSION"
+            printf 'Signed, notarized and tested, built from nirvaana-desktop main at `%s`. The draft (its notes and its 16 files) is linked from the publish job.\n\n' "$COMMIT"
+            printf 'To publish: **Review deployments**, tick **publish**, **Approve and deploy**. To stop it: **Reject** (the draft stays unpublished).\n'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "Nirvaana $VERSION from $COMMIT is waiting for approval."
+
+  publish:
+    needs: show
+    name: Publish Nirvaana ${{ github.event.client_payload.version }}
+    runs-on: ubuntu-24.04
+    # Long enough to download and hash the files if GitHub gives no digest.
+    timeout-minutes: 30
+    environment:
+      name: publish
+      url: ${{ github.event.client_payload.draft_url }}
+    permissions:
+      contents: write
+    steps:
+      - name: Check the draft, publish it as the latest release, check the feed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          VERSION: ${{ github.event.client_payload.version }}
+          TAG: ${{ github.event.client_payload.tag }}
+          COMMIT: ${{ github.event.client_payload.commit }}
+          SHA256: ${{ github.event.client_payload.sha256 }}
+        run: |
+          set -euo pipefail
+          NEVER_TAG="v0.1.8"
+          fail() {
+            echo "::error::$*"
+            printf '## Nirvaana %s was not published\n\n%s\n' "$VERSION" "$*" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          }
+          ok() { printf '  ok   %s\n' "$*"; }
+
+          [ "$REPO" = "Nirvaana-AI-INC/nirvaana-releases" ] || fail "this runs in Nirvaana-AI-INC/nirvaana-releases only."
+          [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || fail "'$VERSION' is not a version."
+          [ "$TAG" = "v$VERSION" ] || fail "the tag $TAG is not v$VERSION."
+          [[ "$COMMIT" =~ ^[0-9a-f]{40}$ ]] || fail "'$COMMIT' is not a commit."
+          [ "$TAG" != "$NEVER_TAG" ] || fail "$NEVER_TAG must never be published."
+
+          # Every release: id, tag, draft, and whether the desktop workflow made it.
+          gh api --paginate "repos/$REPO/releases?per_page=100" \
+            --jq '.[] | [(.id|tostring), .tag_name, (.draft|tostring), ((.body // "") | contains("<!-- nirvaana-cd desktop-commit=") | tostring)] | @tsv' \
+            > "$RUNNER_TEMP/releases.tsv"
+          id="$(awk -F'\t' -v t="$TAG" '$2 == t && $3 == "true" { print $1 }' "$RUNNER_TEMP/releases.tsv")"
+          [ -n "$id" ] && [ "$(printf '%s\n' "$id" | grep -c .)" = "1" ] \
+            || fail "there is no draft $TAG (a newer merge replaced it, or it was published or deleted). Nothing was published."
+
+          # A newer desktop draft waiting? Then this one is superseded.
+          while IFS="$(printf '\t')" read -r _ tag draft marked; do
+            if [ "$draft" = "true" ] && [ "$marked" = "true" ] && [ "$tag" != "$TAG" ] && [ "$tag" != "$NEVER_TAG" ] \
+              && [ "$(printf '%s\n%s\n' "${tag#v}" "$VERSION" | sort -V | tail -1)" = "${tag#v}" ]; then
+              fail "a newer draft $tag is waiting; it supersedes $TAG. Nothing was published."
+            fi
+          done < "$RUNNER_TEMP/releases.tsv"
+
+          # The draft: built from that commit, the 16 files, all uploaded, the feeds for this version.
+          gh api "repos/$REPO/releases/$id" > "$RUNNER_TEMP/release.json"
+          [ "$(jq -r .draft "$RUNNER_TEMP/release.json")" = "true" ] || fail "$TAG is not a draft any more."
+          jq -r .body "$RUNNER_TEMP/release.json" | grep -Fq "<!-- nirvaana-cd desktop-commit=$COMMIT -->" \
+            || fail "the draft $TAG was not built from $COMMIT."
+          [ "$(jq '.assets | length' "$RUNNER_TEMP/release.json")" = "16" ] || fail "the draft $TAG does not have the 16 files."
+          [ "$(jq '[.assets[] | select(.state != "uploaded")] | length' "$RUNNER_TEMP/release.json")" = "0" ] \
+            || fail "not every file of the draft $TAG is uploaded."
+          for name in latest-mac.yml latest.yml Nirvaana-mac-arm64.dmg Nirvaana-mac-intel.dmg \
+            "Nirvaana-$VERSION-arm64-mac.zip" "Nirvaana-$VERSION-x64-mac.zip" \
+            "Nirvaana-$VERSION-x64-setup.exe" "Nirvaana-$VERSION-arm64-setup.exe"; do
+            jq -e --arg n "$name" '.assets[] | select(.name == $n)' "$RUNNER_TEMP/release.json" >/dev/null \
+              || fail "the draft $TAG has no $name."
+          done
+          for feed in latest-mac.yml latest.yml; do
+            aid="$(jq -r --arg n "$feed" '.assets[] | select(.name == $n) | .id' "$RUNNER_TEMP/release.json")"
+            gh api -H "Accept: application/octet-stream" "repos/$REPO/releases/assets/$aid" > "$RUNNER_TEMP/$feed"
+            grep -Fxq "version: $VERSION" "$RUNNER_TEMP/$feed" || fail "the draft's $feed is not for $VERSION."
+          done
+          ok "the draft $TAG: built from $COMMIT, 16 files uploaded, latest-mac.yml and latest.yml for $VERSION"
+
+          # Each file is the one the build made: the SHA-256s the desktop workflow sent, against
+          # GitHub's digest of each uploaded file (or the file itself, downloaded, where GitHub
+          # gives none). Exactly the 16 names, nothing else.
+          printf '%s\n' "$SHA256" | grep -v '^$' > "$RUNNER_TEMP/sums.txt" || true
+          [ "$(grep -c . "$RUNNER_TEMP/sums.txt" || true)" = "16" ] || fail "the approval request does not carry 16 SHA-256s."
+          if grep -Evq '^[0-9a-f]{64}  [A-Za-z0-9._-]+$' "$RUNNER_TEMP/sums.txt"; then fail "the approval request's SHA-256 list is malformed."; fi
+          diff <(sed 's/^[0-9a-f]*  //' "$RUNNER_TEMP/sums.txt" | LC_ALL=C sort) \
+            <(jq -r '.assets[].name' "$RUNNER_TEMP/release.json" | LC_ALL=C sort) >/dev/null \
+            || fail "the draft's files are not the 16 the build made."
+          while read -r want name; do
+            digest="$(jq -r --arg n "$name" '.assets[] | select(.name == $n) | (.digest // "")' "$RUNNER_TEMP/release.json")"
+            if [ -n "$digest" ]; then
+              [ "$digest" = "sha256:$want" ] || fail "$name on the draft is not the file the build made (SHA-256). Nothing was published."
+            else
+              aid="$(jq -r --arg n "$name" '.assets[] | select(.name == $n) | .id' "$RUNNER_TEMP/release.json")"
+              got="$(gh api -H "Accept: application/octet-stream" "repos/$REPO/releases/assets/$aid" | sha256sum | cut -d' ' -f1)"
+              [ "$got" = "$want" ] || fail "$name on the draft is not the file the build made (SHA-256). Nothing was published."
+            fi
+          done < "$RUNNER_TEMP/sums.txt"
+          ok "each of the 16 files is the one the build made (SHA-256)"
+
+          # Higher than every published version (not only GitHub's "latest").
+          highest="$(gh api --paginate "repos/$REPO/releases?per_page=100" \
+            --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name' \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sed 's/^v//' | sort -V | tail -1)"
+          if [ -n "$highest" ]; then
+            [ "$(printf '%s\n%s\n' "$highest" "$VERSION" | sort -V | tail -1)" = "$VERSION" ] && [ "$highest" != "$VERSION" ] \
+              || fail "$VERSION is not higher than the published $highest."
+          fi
+          ok "$VERSION is higher than every published version (${highest:-none})"
+
+          # Publish, as the latest release. Publishing creates the tag $TAG, which the "release tags"
+          # ruleset must allow this workflow (GitHub Actions) to create.
+          if ! gh api -X PATCH "repos/$REPO/releases/$id" -F draft=false -f make_latest=true > "$RUNNER_TEMP/published.json" 2> "$RUNNER_TEMP/publish.err"; then
+            cat "$RUNNER_TEMP/publish.err" >&2
+            if grep -qiE 'rule|violat|protected|tag' "$RUNNER_TEMP/publish.err"; then
+              fail "GitHub refused to create the tag $TAG: the \"release tags\" ruleset does not let GitHub Actions create tags. Settings > Rules > Rulesets > release tags > Bypass list > Add bypass > GitHub Actions (only that; never open v* tags to everyone). Nothing was published; the draft is still waiting, and this run can be re-run after the change."
+            fi
+            fail "GitHub refused to publish $TAG ($(head -1 "$RUNNER_TEMP/publish.err")). Nothing was published."
+          fi
+          [ "$(jq -r .draft "$RUNNER_TEMP/published.json")" = "false" ] || fail "$TAG is still a draft after publishing. Nothing was published."
+          url="$(jq -r .html_url "$RUNNER_TEMP/published.json")"
+          ok "published: $url"
+
+          now="$(gh api "repos/$REPO/releases/latest" --jq .tag_name)"
+          [ "$now" = "$TAG" ] || fail "$TAG was published, but the latest release is $now. Tell Niko at once."
+          never="$(gh api --paginate "repos/$REPO/releases?per_page=100" --jq ".[] | select(.tag_name == \"$NEVER_TAG\") | .draft")"
+          [ -z "$never" ] || [ "$never" = "true" ] || fail "$NEVER_TAG is no longer a draft. Tell Niko at once."
+          ok "$TAG is the latest release; $NEVER_TAG is still a draft"
+
+          # The feed (GitHub's redirect can take a moment to follow).
+          served=""
+          for _ in $(seq 1 12); do
+            if curl -fsSL "https://github.com/$REPO/releases/latest/download/latest-mac.yml" | grep -Fxq "version: $VERSION" \
+              && curl -fsSL "https://github.com/$REPO/releases/latest/download/latest.yml" | grep -Fxq "version: $VERSION"; then
+              served=1
+              break
+            fi
+            sleep 10
+          done
+          if [ -n "$served" ]; then ok "the feed offers $VERSION"; else echo "::warning::The feed did not answer with $VERSION within two minutes; check releases/latest/download/latest-mac.yml."; fi
+
+          {
+            printf '## Nirvaana %s is published\n\n' "$VERSION"
+            printf '%s\n\nInstalled apps find it within four hours (or at once with Check for updates in Settings) and show Restart to update under the person'"'"'s name.\n' "$url"
+          } >> "$GITHUB_STEP_SUMMARY"
